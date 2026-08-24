@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <Container version="2">
-  <Name>Homebox-Shim</Name>
+  <Name>HomeBoxMCP</Name>
   <Repository>ghcr.io/businessnone/homeboxmcp:latest</Repository>
   <Registry>https://github.com/BusinessNone/HomeBoxMCP/pkgs/container/homeboxmcp</Registry>
   <Network>bridge</Network>
@@ -26,8 +26,8 @@
   </Overview>
   <Category>Tools: HomeAutomation: Productivity:</Category>
   <WebUI>http://[IP]:[PORT:3334]/healthz</WebUI>
-  <TemplateURL>https://raw.githubusercontent.com/BusinessNone/HomeBoxMCP/main/unraid/homebox-shim.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/BusinessNone/HomeBoxMCP/main/unraid/homebox-shim-icon.png</Icon>
+  <TemplateURL>https://raw.githubusercontent.com/BusinessNone/HomeBoxMCP/main/unraid/homeboxMCP.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/BusinessNone/HomeBoxMCP/main/unraid/homeboxMCP-icon.png</Icon>
   <ExtraParams/>
   <PostArgs/>
   <CPUset/>
@@ -39,13 +39,13 @@
           Description="Port the MCP server listens on. Point your MCP client at http://[IP]:[PORT]/mcp"
           Type="Port" Display="always" Required="true" Mask="false">3334</Config>
 
-  <Config Name="Config Directory" Target="/config" Default="/mnt/user/appdata/homebox-shim/config" Mode="rw"
+  <Config Name="Config Directory" Target="/config" Default="/mnt/user/appdata/homeboxmcp/config" Mode="rw"
           Description="Holds config.json. Leave the Homebox URL/API key variables blank if you configure via this file instead."
-          Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/homebox-shim/config</Config>
+          Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/homeboxmcp/config</Config>
 
-  <Config Name="Inbox Directory" Target="/inbox" Default="/mnt/user/appdata/homebox-shim/inbox" Mode="ro"
+  <Config Name="Inbox Directory" Target="/inbox" Default="/mnt/user/appdata/homeboxmcp/inbox" Mode="ro"
           Description="Read-only staging directory for files to attach. Drop receipts, manuals and photos here, then attach them by filename. Mounted read-only on purpose: the server never writes to or deletes from your share."
-          Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/homebox-shim/inbox</Config>
+          Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/homeboxmcp/inbox</Config>
 
   <Config Name="Homebox URL" Target="HOMEBOX_URL" Default="" Mode=""
           Description="Base URL of your Homebox instance, e.g. http://192.168.1.10:7745 — no trailing /api/v1. Leave blank if set in config.json."
