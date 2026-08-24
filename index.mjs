@@ -1,4 +1,4 @@
-// homeboxMCP - stateless streamable HTTP MCP server for Homebox, zero dependencies.
+// homeboxmcp - stateless streamable HTTP MCP server for Homebox, zero dependencies.
 // Targets the Homebox v0.26.x entity API (items + locations unified as "entities",
 // labels renamed to "tags"). Built against /swagger/doc.json on v0.26.2.
 import http from "node:http";
@@ -683,7 +683,7 @@ async function handleRpc(msg) {
         ? params.protocolVersion
         : PROTOCOL_VERSIONS[0],
       capabilities: { tools: {} },
-      serverInfo: { name: "homeboxMCP", version: VERSION },
+      serverInfo: { name: "homeboxmcp", version: VERSION },
       instructions:
         "Homebox inventory. Call entity_tree first to discover location IDs, then create_item with parentId set.",
     });
@@ -749,7 +749,7 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === "GET" && (pathname === "/healthz" || pathname === "/")) {
-    return send(200, { ok: true, server: "homeboxMCP", version: VERSION, tools: PUBLIC.length });
+    return send(200, { ok: true, server: "homeboxmcp", version: VERSION, tools: PUBLIC.length });
   }
 
   // JSON-RPC lives only on MCP_PATH; the health endpoints above are the only other route.
@@ -855,5 +855,5 @@ if (process.argv.includes("--doctor")) {
 }
 
 server.listen(PORT, "0.0.0.0", () =>
-  log("info", "listening", { server: "homeboxMCP", version: VERSION, port: PORT, path: MCP_PATH, base: BASE, tools: PUBLIC.length })
+  log("info", "listening", { server: "homeboxmcp", version: VERSION, port: PORT, path: MCP_PATH, base: BASE, tools: PUBLIC.length })
 );
