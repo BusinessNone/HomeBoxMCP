@@ -1,4 +1,4 @@
-# Reconstructed from the running homeboxMCP image (node:22-alpine, /app/index.mjs).
+# Reconstructed from the running homeboxmcp image (node:22-alpine, /app/index.mjs).
 # The original build context was lost; index.mjs was recovered from the image itself.
 FROM node:22-alpine
 

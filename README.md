@@ -57,7 +57,7 @@ docker run --rm -v /path/to/config:/config:ro \
 
 ### Unraid
 
-An Unraid template lives at [`unraid/homeboxMCP.xml`](unraid/homeboxMCP.xml). Add it under
+An Unraid template lives at [`unraid/homeboxmcp.xml`](unraid/homeboxmcp.xml). Add it under
 **Docker → Add Container → Template** using the raw URL, or install from Community Apps
 once listed. Set the config and inbox paths to shares you control, and set an MCP auth
 token if the container is reachable beyond your LAN.

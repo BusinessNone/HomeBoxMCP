@@ -79,7 +79,7 @@ jobs:
             type=sha,format=short
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.title=homeboxMCP
+            org.opencontainers.image.title=homeboxmcp
             org.opencontainers.image.description=Zero-dependency MCP server for Homebox inventory
             org.opencontainers.image.licenses=MIT
 

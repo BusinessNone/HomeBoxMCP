@@ -23,7 +23,7 @@ describe("JSON-RPC protocol surface", () => {
     const res = await shim.get("/healthz");
     assert.equal(res.status, 200);
     assert.equal(res.body.ok, true);
-    assert.equal(res.body.server, "homeboxMCP");
+    assert.equal(res.body.server, "homeboxmcp");
     assert.match(res.body.version, /^\d+\.\d+\.\d+/, `unexpected version: ${res.body.version}`);
     assert.equal(res.body.tools, EXPECTED_TOOL_COUNT);
   });

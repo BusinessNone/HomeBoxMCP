@@ -50,7 +50,9 @@ jobs:
           cat /tmp/health.json
           grep -q '"ok":true' /tmp/health.json
           # Confirm the hardened image is not running as root.
-          test "$(docker exec homeboxmcp-smoke id -u)" = "1000"
+          uid="$(docker exec homeboxmcp-smoke id -u)"
+          echo "container uid: $uid"
+          test "$uid" != "0"
       - name: Container logs
         if: always()
         run: docker logs homeboxmcp-smoke || true

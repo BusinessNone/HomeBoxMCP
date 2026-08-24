@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <Container version="2">
-  <Name>HomeBoxMCP</Name>
+  <Name>homeboxmcp</Name>
   <Repository>ghcr.io/businessnone/homeboxmcp:latest</Repository>
   <Registry>https://github.com/BusinessNone/HomeBoxMCP/pkgs/container/homeboxmcp</Registry>
   <Network>bridge</Network>
@@ -26,8 +26,8 @@
   </Overview>
   <Category>Tools: HomeAutomation: Productivity:</Category>
   <WebUI>http://[IP]:[PORT:3334]/healthz</WebUI>
-  <TemplateURL>https://raw.githubusercontent.com/BusinessNone/HomeBoxMCP/main/unraid/homeboxMCP.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/BusinessNone/HomeBoxMCP/main/unraid/homeboxMCP-icon.png</Icon>
+  <TemplateURL>https://raw.githubusercontent.com/BusinessNone/HomeBoxMCP/main/unraid/homeboxmcp.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/BusinessNone/HomeBoxMCP/main/unraid/homeboxmcp-icon.png</Icon>
   <ExtraParams/>
   <PostArgs/>
   <CPUset/>
