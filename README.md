@@ -37,6 +37,11 @@ docker run -d --name Homebox-Shim -p 3334:3334 \
 | `CONFIG_PATH` | `/config/config.json` | Config file |
 | `INBOX_PATH` | `/inbox` | Read-only upload staging dir |
 | `MAX_UPLOAD_MB` | `10` | Must match Homebox's `HBOX_WEB_MAX_UPLOAD_SIZE` |
+| `MCP_AUTH_TOKEN` | unset | Optional bearer token required for non-local MCP requests |
+| `MAX_REQUEST_BYTES` | `4000000` | Maximum accepted JSON-RPC request size |
+| `LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug` |
+
+Run `node /app/index.mjs --doctor` to validate the configured Homebox URL and fail fast with a clear explanation before the server starts serving MCP requests.
 
 ## Tools (16)
 

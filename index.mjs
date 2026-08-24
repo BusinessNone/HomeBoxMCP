@@ -5,18 +5,48 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 
+const VERSION = "1.1.1";
 const CONFIG_PATH = process.env.CONFIG_PATH || "/config/config.json";
 const PORT = Number(process.env.PORT || 3334);
+const MAX_REQUEST_BYTES = Number(process.env.MAX_REQUEST_BYTES || 4_000_000);
+const LOG_LEVEL = (process.env.LOG_LEVEL || "info").toLowerCase();
+const LOG_PRIORITY = { error: 50, warn: 40, info: 30, debug: 20 };
+
+function log(level, event, meta = {}) {
+  const normalized = (level || "info").toLowerCase();
+  if ((LOG_PRIORITY[normalized] ?? LOG_PRIORITY.info) < (LOG_PRIORITY[LOG_LEVEL] ?? LOG_PRIORITY.info)) {
+    return;
+  }
+  const entry = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      level: normalized,
+      event,
+      ...meta,
+    });
+  process.stderr.write(`${entry}\n`);
+}
+
+function parseConfigFile() {
+  if (!fs.existsSync(CONFIG_PATH)) return {};
+  try {
+    const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") throw new Error("config must be a JSON object");
+    return parsed;
+  } catch (e) {
+    throw new Error(`invalid JSON in ${CONFIG_PATH}: ${e.message}`);
+  }
+}
 
 function loadConfig() {
-  // API key wins: it needs no refresh. Falls back to email/password login.
-  const key = process.env.HOMEBOX_API_KEY;
-  const url = process.env.HOMEBOX_URL;
-  if (key && url) return { homeboxUrl: url, apiKey: key };
-  if (fs.existsSync(CONFIG_PATH)) {
-    const c = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
-    if (c.homeboxUrl) return c;
+  const fileCfg = parseConfigFile();
+  const key = (process.env.HOMEBOX_API_KEY || fileCfg.apiKey || "").trim();
+  const url = (process.env.HOMEBOX_URL || fileCfg.homeboxUrl || "").trim();
+
+  if (key && url) {
+    return { homeboxUrl: url, apiKey: key };
   }
+
   if (url && process.env.HOMEBOX_EMAIL && process.env.HOMEBOX_PASSWORD) {
     return {
       homeboxUrl: url,
@@ -24,18 +54,64 @@ function loadConfig() {
       password: process.env.HOMEBOX_PASSWORD,
     };
   }
-  console.error(`No config: need ${CONFIG_PATH} or HOMEBOX_URL + credentials`);
-  process.exit(1);
+
+  if (fileCfg.homeboxUrl && (fileCfg.apiKey || (fileCfg.email && fileCfg.password))) {
+    return {
+      homeboxUrl: fileCfg.homeboxUrl,
+      ...(fileCfg.apiKey ? { apiKey: fileCfg.apiKey } : { email: fileCfg.email, password: fileCfg.password }),
+    };
+  }
+
+  throw new Error(`No config: set HOMEBOX_URL + credentials or create ${CONFIG_PATH}`);
+}
+
+function validateConfig(cfg) {
+  try {
+    const u = new URL(cfg.homeboxUrl);
+    if (!["http:", "https:"].includes(u.protocol)) {
+      throw new Error(`unsupported URL scheme: ${u.protocol}`);
+    }
+  } catch (e) {
+    throw new Error(`invalid HOMEBOX_URL: ${cfg.homeboxUrl} (${e.message})`);
+  }
+
+  if (!Number.isFinite(PORT) || PORT < 1 || PORT > 65535) {
+    throw new Error(`PORT must be between 1 and 65535; received ${PORT}`);
+  }
+
+  if (!Number.isFinite(MAX_REQUEST_BYTES) || MAX_REQUEST_BYTES <= 0) {
+    throw new Error(`MAX_REQUEST_BYTES must be a positive number; received ${MAX_REQUEST_BYTES}`);
+  }
+
+  if (process.env.MCP_AUTH_TOKEN && process.env.MCP_AUTH_TOKEN.trim() === "") {
+    throw new Error("MCP_AUTH_TOKEN must not be empty when set");
+  }
 }
 
 const cfg = loadConfig();
+validateConfig(cfg);
 const BASE = cfg.homeboxUrl.replace(/\/$/, "") + "/api/v1";
 let token = cfg.apiKey ? `Bearer ${cfg.apiKey}` : null;
 let typeCache = null;
 
+async function safeFetch(url, options = {}, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (e) {
+    if (e?.name === "AbortError") {
+      throw new Error(`request timed out after ${timeoutMs}ms`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function login() {
   if (cfg.apiKey) return token;
-  const r = await fetch(`${BASE}/users/login`, {
+  const r = await safeFetch(`${BASE}/users/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username: cfg.email, password: cfg.password }),
@@ -44,14 +120,14 @@ async function login() {
   const j = await r.json();
   const t = j.token || j.accessToken;
   if (!t) throw new Error("login returned no token");
-  token = t.startsWith("Bearer ") ? t : `Bearer ${t}`;
-  return token;
+    token = /^Bearer\s+/i.test(t) ? t : `Bearer ${t}`;
+return token;
 }
 
-// Single request path. Re-authenticates once on 401 so a expired token is invisible.
+// Single request path. Re-authenticates once on 401 so an expired token is invisible.
 async function api(method, path, body, _retried = false) {
   if (!token) await login();
-  const r = await fetch(`${BASE}${path}`, {
+  const r = await safeFetch(`${BASE}${path}`, {
     method,
     headers: {
       Authorization: token,
@@ -70,6 +146,21 @@ async function api(method, path, body, _retried = false) {
     return JSON.parse(text);
   } catch {
     return text;
+  }
+}
+
+async function preflightCheck() {
+  try {
+    const r = await safeFetch(`${cfg.homeboxUrl.replace(/\/$/, "")}/api/v1/status`, { method: "GET" }, 10000);
+    if (r.status === 401) {
+      return { ok: false, reason: "unauthorized" };
+    }
+    if (!r.ok) {
+      return { ok: false, reason: `http_${r.status}` };
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, reason: e.message };
   }
 }
 
@@ -177,8 +268,14 @@ const mimeFor = (n) => MIME[(n.split(".").pop() || "").toLowerCase()] || "applic
 function inboxPath(rel) {
   if (!rel || typeof rel !== "string") throw new Error("file is required");
   const full = path.resolve(INBOX, rel);
-  const root = path.resolve(INBOX);
-  if (full !== root && !full.startsWith(root + path.sep)) {
+  const root = fs.existsSync(INBOX) ? fs.realpathSync.native(INBOX) : path.resolve(INBOX);
+  try {
+    const target = fs.existsSync(full) ? fs.realpathSync.native(full) : path.resolve(full);
+    if (target !== root && !target.startsWith(root + path.sep)) {
+      throw new Error(`refused: '${rel}' resolves outside the inbox`);
+    }
+  } catch (e) {
+    if (e.message && e.message.includes("resolves outside the inbox")) throw e;
     throw new Error(`refused: '${rel}' resolves outside the inbox`);
   }
   if (!fs.existsSync(full)) {
@@ -192,7 +289,7 @@ function inboxPath(rel) {
 // api() hardcodes Content-Type: application/json, so multipart needs this parallel path.
 async function apiUpload(urlPath, form, _retried = false) {
   if (!token) await login();
-  const r = await fetch(`${BASE}${urlPath}`, {
+  const r = await safeFetch(`${BASE}${urlPath}`, {
     method: "POST",
     headers: { Authorization: token },
     body: form,
@@ -495,7 +592,7 @@ async function handleRpc(msg) {
     return reply({
       protocolVersion: params?.protocolVersion || "2024-11-05",
       capabilities: { tools: {} },
-      serverInfo: { name: "homebox-shim", version: "1.1.0" },
+      serverInfo: { name: "homebox-shim", version: VERSION },
       instructions:
         "Homebox inventory. Call entity_tree first to discover location IDs, then create_item with parentId set.",
     });
@@ -525,6 +622,17 @@ async function handleRpc(msg) {
   return { jsonrpc: "2.0", id, error: { code: -32601, message: `unknown method: ${method}` } };
 }
 
+const MCP_TOKEN = process.env.MCP_AUTH_TOKEN ? process.env.MCP_AUTH_TOKEN.trim() : null;
+
+function hasValidMcpAuth(req) {
+  if (!MCP_TOKEN) return true;
+  const supplied = req.headers.authorization ?? req.headers["x-mcp-token"] ?? req.headers["x-homebox-mcp-token"];
+  if (!supplied) return false;
+  const value = Array.isArray(supplied) ? supplied[0] : supplied;
+  const token = value.startsWith("Bearer ") ? value.slice(7).trim() : value.trim();
+  return token === MCP_TOKEN;
+}
+
 const server = http.createServer((req, res) => {
   const send = (code, obj) => {
     const b = obj === null ? "" : JSON.stringify(obj);
@@ -536,14 +644,24 @@ const server = http.createServer((req, res) => {
   };
 
   if (req.method === "GET" && (req.url === "/healthz" || req.url === "/")) {
-    return send(200, { ok: true, server: "homebox-shim", tools: PUBLIC.length });
+    return send(200, { ok: true, server: "homebox-shim", version: VERSION, tools: PUBLIC.length });
   }
   if (req.method !== "POST") return send(405, { error: "method not allowed" });
+  if (!hasValidMcpAuth(req)) {
+    return send(401, { jsonrpc: "2.0", id: null, error: { code: -32001, message: "authentication required" } });
+  }
+
+  const declaredLength = Number(req.headers["content-length"] || "0");
+  if (declaredLength > MAX_REQUEST_BYTES) {
+    return send(413, { jsonrpc: "2.0", id: null, error: { code: -32000, message: `request body exceeds ${MAX_REQUEST_BYTES} bytes` } });
+  }
 
   let raw = "";
   req.on("data", (c) => {
     raw += c;
-    if (raw.length > 4_000_000) req.destroy();
+    if (raw.length > MAX_REQUEST_BYTES) {
+      req.destroy(new Error(`request body exceeds ${MAX_REQUEST_BYTES} bytes`));
+    }
   });
   req.on("end", async () => {
     let msg;
@@ -567,6 +685,15 @@ const server = http.createServer((req, res) => {
   });
 });
 
+server.keepAliveTimeout = 5000;
+server.headersTimeout = 15000;
+
+if (process.argv.includes("--doctor")) {
+  const status = await preflightCheck();
+  console.error(JSON.stringify({ event: "doctor", ok: status.ok, reason: status.reason ?? "ok" }));
+  process.exit(status.ok ? 0 : 1);
+}
+
 server.listen(PORT, "0.0.0.0", () =>
-  console.error(`homebox-shim listening on :${PORT}/mcp -> ${BASE} (${PUBLIC.length} tools)`)
+  console.error(`homebox-shim ${VERSION} listening on :${PORT}/mcp -> ${BASE} (${PUBLIC.length} tools)`)
 );
