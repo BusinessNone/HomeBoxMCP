@@ -1,0 +1,89 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>homeboxmcp</Name>
+  <Repository>ghcr.io/businessnone/homeboxmcp:latest</Repository>
+  <Registry>https://github.com/BusinessNone/HomeBoxMCP/pkgs/container/homeboxmcp</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/BusinessNone/HomeBoxMCP/issues</Support>
+  <Project>https://github.com/BusinessNone/HomeBoxMCP</Project>
+  <Overview>
+    Model Context Protocol (MCP) server for Homebox, the self-hosted home inventory.
+    Exposes 16 tools over stateless streamable HTTP so an MCP client — Claude or any other —
+    can search your inventory, create and move items and locations, manage tags, and attach
+    receipts, manuals and photos in plain language.
+
+    Requires a running Homebox instance (v0.26.x, which unifies items and locations as
+    "entities" and renames labels to "tags") and an API key or login for it.
+
+    Files are attached via a read-only inbox mount rather than inline base64: drop a file
+    into the inbox share, then attach it by filename. Set MCP_AUTH_TOKEN if this container
+    is reachable from anywhere other than your own LAN.
+
+    After starting, verify with: curl http://[IP]:[PORT:3334]/healthz
+  </Overview>
+  <Category>Tools: HomeAutomation: Productivity:</Category>
+  <WebUI>http://[IP]:[PORT:3334]/healthz</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/BusinessNone/HomeBoxMCP/main/unraid/homeboxmcp.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/BusinessNone/HomeBoxMCP/main/unraid/homeboxmcp-icon.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires>A reachable Homebox v0.26.x instance and an API key (or email/password) for it.</Requires>
+
+  <Config Name="MCP Port" Target="3334" Default="3334" Mode="tcp"
+          Description="Port the MCP server listens on. Point your MCP client at http://[IP]:[PORT]/mcp"
+          Type="Port" Display="always" Required="true" Mask="false">3334</Config>
+
+  <Config Name="Config Directory" Target="/config" Default="/mnt/user/appdata/homeboxmcp/config" Mode="rw"
+          Description="Holds config.json. Leave the Homebox URL/API key variables blank if you configure via this file instead."
+          Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/homeboxmcp/config</Config>
+
+  <Config Name="Inbox Directory" Target="/inbox" Default="/mnt/user/appdata/homeboxmcp/inbox" Mode="ro"
+          Description="Read-only staging directory for files to attach. Drop receipts, manuals and photos here, then attach them by filename. Mounted read-only on purpose: the server never writes to or deletes from your share."
+          Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/homeboxmcp/inbox</Config>
+
+  <Config Name="Homebox URL" Target="HOMEBOX_URL" Default="" Mode=""
+          Description="Base URL of your Homebox instance, e.g. http://192.168.1.10:7745 — no trailing /api/v1. Leave blank if set in config.json."
+          Type="Variable" Display="always" Required="false" Mask="false"/>
+
+  <Config Name="Homebox API Key" Target="HOMEBOX_API_KEY" Default="" Mode=""
+          Description="API key for Homebox. Preferred over email/password. Leave blank if set in config.json."
+          Type="Variable" Display="always" Required="false" Mask="true"/>
+
+  <Config Name="MCP Auth Token" Target="MCP_AUTH_TOKEN" Default="" Mode=""
+          Description="Bearer token required on every MCP request. STRONGLY recommended if this container is reachable beyond your LAN. Leave blank to disable authentication entirely."
+          Type="Variable" Display="always" Required="false" Mask="true"/>
+
+  <Config Name="Max Upload MB" Target="MAX_UPLOAD_MB" Default="10" Mode=""
+          Description="Largest attachment accepted. Must match Homebox's own HBOX_WEB_MAX_UPLOAD_SIZE, or uploads will fail at the Homebox end instead of being rejected here with a clear message."
+          Type="Variable" Display="advanced" Required="false" Mask="false">10</Config>
+
+  <Config Name="MCP Path" Target="MCP_PATH" Default="/mcp" Mode=""
+          Description="Path the JSON-RPC endpoint is served on. Change only if something else needs /mcp."
+          Type="Variable" Display="advanced" Required="false" Mask="false">/mcp</Config>
+
+  <Config Name="Log Level" Target="LOG_LEVEL" Default="info" Mode=""
+          Description="error, warn, info or debug. Use debug when diagnosing a client that will not connect."
+          Type="Variable" Display="advanced" Required="false" Mask="false">info</Config>
+
+  <Config Name="Max Request Bytes" Target="MAX_REQUEST_BYTES" Default="4000000" Mode=""
+          Description="Largest accepted JSON-RPC request body, in bytes."
+          Type="Variable" Display="advanced" Required="false" Mask="false">4000000</Config>
+
+  <Config Name="Entity Type Cache TTL (ms)" Target="ENTITY_TYPE_TTL_MS" Default="86400000" Mode=""
+          Description="How long Homebox entity type IDs are cached. Default 24h. Set 0 to disable caching while debugging."
+          Type="Variable" Display="advanced" Required="false" Mask="false">86400000</Config>
+
+  <Config Name="Homebox Email" Target="HOMEBOX_EMAIL" Default="" Mode=""
+          Description="Only if you are not using an API key. Requires the password variable too."
+          Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+  <Config Name="Homebox Password" Target="HOMEBOX_PASSWORD" Default="" Mode=""
+          Description="Only if you are not using an API key."
+          Type="Variable" Display="advanced" Required="false" Mask="true"/>
+</Container>

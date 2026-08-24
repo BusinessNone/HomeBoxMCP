@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Syntax check
+        run: node --check index.mjs
+      - name: Tests
+        run: npm test
+
+  docker:
+    # Build only - never push. Publishing lives in release.yml so that pull
+    # requests from forks never need registry credentials.
+    name: docker build (no push)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t homeboxmcp:ci .
+      - name: Smoke test the image
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/config"
+          # A config pointing at an unreachable Homebox is enough: /healthz must
+          # answer regardless of upstream reachability.
+          printf '{"homeboxUrl":"http://127.0.0.1:1","apiKey":"ci-smoke-test"}' \
+            > "$RUNNER_TEMP/config/config.json"
+          docker run -d --name homeboxmcp-smoke \
+            -p 3334:3334 \
+            -v "$RUNNER_TEMP/config:/config:ro" \
+            homeboxmcp:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3334/healthz > /tmp/health.json; then break; fi
+            sleep 1
+          done
+          cat /tmp/health.json
+          grep -q '"ok":true' /tmp/health.json
+          # Confirm the hardened image is not running as root.
+          uid="$(docker exec homeboxmcp-smoke id -u)"
+          echo "container uid: $uid"
+          test "$uid" != "0"
+      - name: Container logs
+        if: always()
+        run: docker logs homeboxmcp-smoke || true
+      - name: Clean up
+        if: always()
+        run: docker rm -f homeboxmcp-smoke || true

@@ -1,0 +1,18 @@
+{
+  "name": "homeboxmcp",
+  "version": "1.2.0",
+  "description": "Zero-dependency MCP server for Homebox inventory, served over stateless streamable HTTP.",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "main": "index.mjs",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node index.mjs",
+    "doctor": "node index.mjs --doctor",
+    "check": "node --check index.mjs",
+    "test": "node --test \"test/**/*.test.mjs\""
+  }
+}

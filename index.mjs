@@ -1,15 +1,24 @@
-// Homebox MCP shim - stateless streamable HTTP, zero dependencies.
+// homeboxmcp - stateless streamable HTTP MCP server for Homebox, zero dependencies.
 // Targets the Homebox v0.26.x entity API (items + locations unified as "entities",
 // labels renamed to "tags"). Built against /swagger/doc.json on v0.26.2.
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 
-const VERSION = "1.1.1";
+const VERSION = "1.2.0";
 const CONFIG_PATH = process.env.CONFIG_PATH || "/config/config.json";
 const PORT = Number(process.env.PORT || 3334);
 const MAX_REQUEST_BYTES = Number(process.env.MAX_REQUEST_BYTES || 4_000_000);
 const LOG_LEVEL = (process.env.LOG_LEVEL || "info").toLowerCase();
+// Endpoint JSON-RPC is served on. Trailing slashes stripped so /mcp and /mcp/ match.
+const MCP_PATH = (process.env.MCP_PATH || "/mcp").trim().replace(/\/+$/, "");
+// Entity types are stable but not immutable: a type added after startup was invisible
+// until restart. 0 disables caching entirely, which is useful while debugging.
+const ENTITY_TYPE_TTL_MS = Number(process.env.ENTITY_TYPE_TTL_MS ?? 86_400_000);
+// Homebox's own cap (HBOX_WEB_MAX_UPLOAD_SIZE, in MB). Declared here so
+// validateConfig() can reject a garbage value before it becomes a silent NaN.
+const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 10);
 const LOG_PRIORITY = { error: 50, warn: 40, info: 30, debug: 20 };
 
 function log(level, event, meta = {}) {
@@ -83,13 +92,37 @@ function validateConfig(cfg) {
     throw new Error(`MAX_REQUEST_BYTES must be a positive number; received ${MAX_REQUEST_BYTES}`);
   }
 
+  // 0 is allowed on purpose ("never cache"), so this checks >= 0, not > 0.
+  if (!Number.isFinite(ENTITY_TYPE_TTL_MS) || ENTITY_TYPE_TTL_MS < 0) {
+    throw new Error(`ENTITY_TYPE_TTL_MS must be a non-negative number; received ${process.env.ENTITY_TYPE_TTL_MS}`);
+  }
+
+  // "/" normalizes to "" here, which is rejected: it would collide with GET / healthz.
+  if (!MCP_PATH.startsWith("/")) {
+    throw new Error(`MCP_PATH must start with "/" and name a subpath, e.g. /mcp; received ${JSON.stringify(process.env.MCP_PATH)}`);
+  }
+
+  // NaN here would silently disable the upload check and print "at most NaNMB".
+  if (!Number.isFinite(MAX_UPLOAD_MB) || MAX_UPLOAD_MB <= 0) {
+    throw new Error(`MAX_UPLOAD_MB must be a positive number; received ${process.env.MAX_UPLOAD_MB}`);
+  }
+
   if (process.env.MCP_AUTH_TOKEN && process.env.MCP_AUTH_TOKEN.trim() === "") {
     throw new Error("MCP_AUTH_TOKEN must not be empty when set");
   }
 }
 
-const cfg = loadConfig();
-validateConfig(cfg);
+// loadConfig/validateConfig throw at module load, which would otherwise dump a raw
+// stack trace for the most common failure (bad or missing config) - including under
+// --doctor, where a clean explanation is the whole point.
+let cfg;
+try {
+  cfg = loadConfig();
+  validateConfig(cfg);
+} catch (e) {
+  log("error", "config_error", { error: e.message });
+  process.exit(2);
+}
 const BASE = cfg.homeboxUrl.replace(/\/$/, "") + "/api/v1";
 let token = cfg.apiKey ? `Bearer ${cfg.apiKey}` : null;
 let typeCache = null;
@@ -109,24 +142,33 @@ async function safeFetch(url, options = {}, timeoutMs = 30000) {
   }
 }
 
+// Concurrent api() calls with a null token would each fire their own login, so the
+// in-flight promise is shared and cleared once it settles.
+let loginInflight = null;
+
 async function login() {
   if (cfg.apiKey) return token;
-  const r = await safeFetch(`${BASE}/users/login`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username: cfg.email, password: cfg.password }),
-  });
-  if (!r.ok) throw new Error(`login failed: ${r.status} ${await r.text()}`);
-  const j = await r.json();
-  const t = j.token || j.accessToken;
-  if (!t) throw new Error("login returned no token");
+  if (loginInflight) return loginInflight;
+  loginInflight = (async () => {
+    const r = await safeFetch(`${BASE}/users/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: cfg.email, password: cfg.password }),
+    });
+    if (!r.ok) throw new Error(`login failed: ${r.status} ${await r.text()}`);
+    const j = await r.json();
+    const t = j.token || j.accessToken;
+    if (!t) throw new Error("login returned no token");
     token = /^Bearer\s+/i.test(t) ? t : `Bearer ${t}`;
-return token;
+    return token;
+  })().finally(() => { loginInflight = null; });
+  return loginInflight;
 }
 
 // Single request path. Re-authenticates once on 401 so an expired token is invisible.
 async function api(method, path, body, _retried = false) {
   if (!token) await login();
+  const started = Date.now();
   const r = await safeFetch(`${BASE}${path}`, {
     method,
     headers: {
@@ -135,6 +177,7 @@ async function api(method, path, body, _retried = false) {
     },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
+  log("debug", "homebox_call", { method, path, status: r.status, ms: Date.now() - started });
   if (r.status === 401 && !cfg.apiKey && !_retried) {
     token = null;
     return api(method, path, body, true);
@@ -149,35 +192,62 @@ async function api(method, path, body, _retried = false) {
   }
 }
 
+// Two-stage: reachability, then a real authenticated call. An unauthenticated 200 on
+// /status says nothing about the credentials, so a bogus API key used to pass.
 async function preflightCheck() {
   try {
-    const r = await safeFetch(`${cfg.homeboxUrl.replace(/\/$/, "")}/api/v1/status`, { method: "GET" }, 10000);
-    if (r.status === 401) {
-      return { ok: false, reason: "unauthorized" };
-    }
-    if (!r.ok) {
-      return { ok: false, reason: `http_${r.status}` };
-    }
-    return { ok: true };
+    const r = await safeFetch(`${BASE}/status`, { method: "GET" }, 10000);
+    if (!r.ok && r.status !== 401) return { ok: false, reason: `http_${r.status}`, detail: "host reachable, /status errored" };
   } catch (e) {
-    return { ok: false, reason: e.message };
+    return { ok: false, reason: "unreachable", detail: e.message };
+  }
+  try {
+    // /entity-types is also the one call every tool depends on.
+    const types = await entityTypes();
+    return { ok: true, reason: "ok", detail: `authenticated; ${types.all.length} entity types` };
+  } catch (e) {
+    const authFailure = /\b(401|403)\b|login failed/.test(e.message);
+    return { ok: false, reason: authFailure ? "bad_credentials" : "api_error", detail: e.message };
   }
 }
 
 // Homebox creates these per-install, so never hardcode the UUIDs.
-async function entityTypes() {
-  if (typeCache) return typeCache;
-  const list = await api("GET", "/entity-types");
-  typeCache = {
-    item: list.find((t) => !t.isLocation)?.id,
-    location: list.find((t) => t.isLocation)?.id,
-    all: list,
-  };
-  if (!typeCache.item || !typeCache.location) {
-    typeCache = null;
-    throw new Error("could not resolve item/location entity types");
-  }
-  return typeCache;
+// Shares one in-flight fetch, same thundering-herd fix as login().
+let typesInflight = null;
+
+const typesFresh = () =>
+  typeCache !== null && ENTITY_TYPE_TTL_MS > 0 && Date.now() - typeCache.fetchedAt < ENTITY_TYPE_TTL_MS;
+
+async function entityTypes(force = false) {
+  if (!force && typesFresh()) return typeCache;
+  // Cold start and expiry both land here, so a stale entry with N concurrent callers
+  // still produces exactly one refetch.
+  if (typesInflight) return typesInflight;
+  typesInflight = (async () => {
+    const list = await api("GET", "/entity-types");
+    if (!Array.isArray(list)) {
+      throw new Error(`GET /entity-types returned ${typeof list}, expected an array - is HOMEBOX_URL pointing at a Homebox v0.26+ API?`);
+    }
+    const resolved = {
+      item: list.find((t) => !t.isLocation)?.id,
+      location: list.find((t) => t.isLocation)?.id,
+      all: list,
+      fetchedAt: Date.now(),
+    };
+    if (!resolved.item || !resolved.location) {
+      throw new Error("could not resolve item/location entity types");
+    }
+    if (typeCache && (typeCache.item !== resolved.item || typeCache.location !== resolved.location)) {
+      log("warn", "entity_types_changed", {
+        item: resolved.item, location: resolved.location,
+        previousItem: typeCache.item, previousLocation: typeCache.location,
+      });
+    }
+    log("debug", "entity_types_resolved", { item: resolved.item, location: resolved.location, count: list.length });
+    typeCache = resolved;
+    return typeCache;
+  })().finally(() => { typesInflight = null; });
+  return typesInflight;
 }
 
 // GET returns EntityOut (entityType/parent/tags as OBJECTS plus read-only extras);
@@ -221,14 +291,23 @@ function qs(params) {
 // Rich fields only exist on EntityUpdate, so a detailed create is POST then PUT.
 async function createEntity(isLocation, a) {
   const types = await entityTypes();
-  const created = await api("POST", "/entities", {
-    name: a.name,
-    description: a.description ?? "",
-    entityTypeId: isLocation ? types.location : types.item,
-    parentId: a.parentId || null,
-    quantity: a.quantity ?? (isLocation ? 0 : 1),
-    tagIds: a.tagIds ?? [],
-  });
+  let created;
+  try {
+    created = await api("POST", "/entities", {
+      name: a.name,
+      description: a.description ?? "",
+      entityTypeId: isLocation ? types.location : types.item,
+      parentId: a.parentId || null,
+      quantity: a.quantity ?? (isLocation ? 0 : 1),
+      tagIds: a.tagIds ?? [],
+    });
+  } catch (e) {
+    // 404/422 on a create carrying a cached entityTypeId means the ID itself is likely
+    // stale (types recreated in Homebox), so re-resolve next call. Deliberately narrow:
+    // invalidating on any error would turn a transient 500 into a refetch storm.
+    if (/-> (404|422):/.test(e.message)) typeCache = null;
+    throw e;
+  }
   const rich = Object.fromEntries(
     Object.entries(a).filter(
       ([k, v]) => v !== undefined && WRITABLE.has(k) &&
@@ -236,8 +315,17 @@ async function createEntity(isLocation, a) {
     )
   );
   if (Object.keys(rich).length === 0) return created;
-  const current = await api("GET", `/entities/${created.id}`);
-  return api("PUT", `/entities/${created.id}`, toUpdatePayload(current, rich));
+  try {
+    const current = await api("GET", `/entities/${created.id}`);
+    return await api("PUT", `/entities/${created.id}`, toUpdatePayload(current, rich));
+  } catch (e) {
+    // The POST already succeeded. Naming the ID is what lets the caller patch it
+    // instead of retrying the whole create and leaving a duplicate behind.
+    throw new Error(
+      `entity ${created.id} ('${a.name}') WAS CREATED but only partially populated: the detail ` +
+      `fields failed to apply (${e.message}). Do not re-create it; update entity ${created.id} instead.`
+    );
+  }
 }
 
 
@@ -246,10 +334,6 @@ async function createEntity(isLocation, a) {
 // MCP tool calls are JSON, so bytes reach us via a read-only inbox mount rather than
 // being inlined as base64 (a 10MB file would be ~13MB of base64 in the model's context).
 const INBOX = process.env.INBOX_PATH || "/inbox";
-
-// Homebox's own cap (HBOX_WEB_MAX_UPLOAD_SIZE, in MB). Reject early with a clear
-// message instead of letting the server return an opaque 413/422.
-const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 10);
 
 const ATTACHMENT_TYPES = ["attachment", "photo", "manual", "warranty", "receipt", "thumbnail"];
 
@@ -465,9 +549,10 @@ const TOOLS = [
   },
   {
     name: "list_entity_types",
-    description: "List entity types for this install, showing which ID means item vs location.",
+    description:
+      "List entity types for this install, showing which ID means item vs location. Always re-reads from Homebox (bypassing and refreshing the cache), so use it to confirm a newly added type.",
     inputSchema: { type: "object", properties: {} },
-    run: async () => (await entityTypes()).all,
+    run: async () => (await entityTypes(true)).all,
   },
   {
     name: "get_stats",
@@ -584,15 +669,21 @@ const PUBLIC = TOOLS.map(({ name, description, inputSchema }) => ({
   inputSchema,
 }));
 
+// Echoing back whatever the client asked for claimed support for versions we do not
+// implement. Newest first; 2024-11-05 stays for older clients.
+const PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
+
 async function handleRpc(msg) {
   const { id, method, params } = msg ?? {};
   const reply = (result) => ({ jsonrpc: "2.0", id, result });
 
   if (method === "initialize") {
     return reply({
-      protocolVersion: params?.protocolVersion || "2024-11-05",
+      protocolVersion: PROTOCOL_VERSIONS.includes(params?.protocolVersion)
+        ? params.protocolVersion
+        : PROTOCOL_VERSIONS[0],
       capabilities: { tools: {} },
-      serverInfo: { name: "homebox-shim", version: VERSION },
+      serverInfo: { name: "homeboxmcp", version: VERSION },
       instructions:
         "Homebox inventory. Call entity_tree first to discover location IDs, then create_item with parentId set.",
     });
@@ -607,6 +698,8 @@ async function handleRpc(msg) {
         error: { code: -32602, message: `unknown tool: ${params?.name}` },
       };
     }
+    // Name only: arguments can carry serial numbers, notes and other sensitive data.
+    log("debug", "tool_call", { tool: tool.name });
     try {
       const out = await tool.run(params.arguments ?? {});
       return reply({
@@ -614,6 +707,7 @@ async function handleRpc(msg) {
         isError: false,
       });
     } catch (e) {
+      log("error", "tool_failed", { tool: tool.name, error: e.message });
       // Surface as a tool error, not a transport error, so the model can react.
       return reply({ content: [{ type: "text", text: `Error: ${e.message}` }], isError: true });
     }
@@ -630,7 +724,10 @@ function hasValidMcpAuth(req) {
   if (!supplied) return false;
   const value = Array.isArray(supplied) ? supplied[0] : supplied;
   const token = value.startsWith("Bearer ") ? value.slice(7).trim() : value.trim();
-  return token === MCP_TOKEN;
+  // Hashing both sides gives timingSafeEqual equal-length inputs (it throws otherwise)
+  // and keeps the comparison from leaking the expected token's length.
+  const digest = (s) => crypto.createHash("sha256").update(s, "utf8").digest();
+  return crypto.timingSafeEqual(digest(token), digest(MCP_TOKEN));
 }
 
 const server = http.createServer((req, res) => {
@@ -643,34 +740,65 @@ const server = http.createServer((req, res) => {
     res.end(b);
   };
 
-  if (req.method === "GET" && (req.url === "/healthz" || req.url === "/")) {
-    return send(200, { ok: true, server: "homebox-shim", version: VERSION, tools: PUBLIC.length });
+  // req.url carries the query string, so never compare it raw.
+  let pathname;
+  try {
+    pathname = new URL(req.url, "http://localhost").pathname.replace(/\/+$/, "") || "/";
+  } catch {
+    pathname = null;
+  }
+
+  if (req.method === "GET" && (pathname === "/healthz" || pathname === "/")) {
+    return send(200, { ok: true, server: "homeboxmcp", version: VERSION, tools: PUBLIC.length });
+  }
+
+  // JSON-RPC lives only on MCP_PATH; the health endpoints above are the only other route.
+  if (pathname !== MCP_PATH) {
+    log("debug", "path_rejected", { method: req.method, path: pathname });
+    return send(404, {
+      jsonrpc: "2.0",
+      id: null,
+      error: { code: -32002, message: `no endpoint at ${pathname}; the MCP endpoint is POST ${MCP_PATH}` },
+    });
   }
   if (req.method !== "POST") return send(405, { error: "method not allowed" });
   if (!hasValidMcpAuth(req)) {
+    // Never log the supplied or expected token, not even a prefix.
+    log("warn", "auth_rejected", { remote: req.socket.remoteAddress, url: req.url });
     return send(401, { jsonrpc: "2.0", id: null, error: { code: -32001, message: "authentication required" } });
   }
 
   const declaredLength = Number(req.headers["content-length"] || "0");
   if (declaredLength > MAX_REQUEST_BYTES) {
+    log("warn", "request_rejected", { reason: "content_length", bytes: declaredLength, limit: MAX_REQUEST_BYTES });
     return send(413, { jsonrpc: "2.0", id: null, error: { code: -32000, message: `request body exceeds ${MAX_REQUEST_BYTES} bytes` } });
   }
 
-  let raw = "";
+  // Buffers, not string concat: coercing each chunk independently corrupts a multi-byte
+  // UTF-8 character that straddles a chunk boundary. The limit counts bytes, not the
+  // UTF-16 code units a decoded string would have reported.
+  const chunks = [];
+  let bytes = 0;
   req.on("data", (c) => {
-    raw += c;
-    if (raw.length > MAX_REQUEST_BYTES) {
-      req.destroy(new Error(`request body exceeds ${MAX_REQUEST_BYTES} bytes`));
+    bytes += c.length;
+    if (bytes > MAX_REQUEST_BYTES) {
+      log("warn", "request_rejected", { reason: "body_too_large", bytes, limit: MAX_REQUEST_BYTES });
+      return req.destroy(new Error(`request body exceeds ${MAX_REQUEST_BYTES} bytes`));
     }
+    chunks.push(c);
   });
   req.on("end", async () => {
+    const raw = Buffer.concat(chunks).toString("utf8");
+    // Bodies can contain credentials, so the raw dump needs an explicit opt-in
+    // (DEBUG_RPC=1) on top of LOG_LEVEL=debug.
+    if (process.env.DEBUG_RPC) log("debug", "rpc_body", { body: raw.slice(0, 500) });
     let msg;
     try {
       msg = JSON.parse(raw);
     } catch {
+      log("warn", "request_rejected", { reason: "parse_error", bytes });
       return send(400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
     }
-    if (process.env.DEBUG_RPC) console.error("RAW>>> " + raw.slice(0, 500));
     // Notifications carry no id and expect no body.
     if (Array.isArray(msg)) {
       const out = (await Promise.all(msg.map(handleRpc))).filter((r) => r.id !== undefined);
@@ -688,12 +816,44 @@ const server = http.createServer((req, res) => {
 server.keepAliveTimeout = 5000;
 server.headersTimeout = 15000;
 
+let shuttingDown = false;
+
+// Stop accepting connections, let in-flight requests drain, then give up: a hung
+// keep-alive socket must not outlast the container's stop timeout.
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log("info", "shutdown_started", { signal });
+  const force = setTimeout(() => {
+    log("warn", "shutdown_forced", { signal, timeoutMs: 10000 });
+    process.exit(1);
+  }, 10000);
+  force.unref();
+  server.close(() => {
+    clearTimeout(force);
+    log("info", "shutdown_complete", { signal });
+    process.exit(0);
+  });
+  server.closeIdleConnections?.();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("unhandledRejection", (reason) => {
+  log("error", "unhandled_rejection", { error: reason instanceof Error ? reason.message : String(reason) });
+});
+process.on("uncaughtException", (e) => {
+  // State is unknown past this point; the HEALTHCHECK and restart policy recycle us.
+  log("error", "uncaught_exception", { error: e.message, stack: e.stack });
+  process.exit(1);
+});
+
 if (process.argv.includes("--doctor")) {
   const status = await preflightCheck();
-  console.error(JSON.stringify({ event: "doctor", ok: status.ok, reason: status.reason ?? "ok" }));
+  log(status.ok ? "info" : "error", "doctor", { ok: status.ok, reason: status.reason, detail: status.detail });
   process.exit(status.ok ? 0 : 1);
 }
 
 server.listen(PORT, "0.0.0.0", () =>
-  console.error(`homebox-shim ${VERSION} listening on :${PORT}/mcp -> ${BASE} (${PUBLIC.length} tools)`)
+  log("info", "listening", { server: "homeboxmcp", version: VERSION, port: PORT, path: MCP_PATH, base: BASE, tools: PUBLIC.length })
 );

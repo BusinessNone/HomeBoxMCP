@@ -28,23 +28,39 @@ Drop it behind Docker and forget about it.
 
 ## Quick start
 
+Pull the published image:
+
 ```bash
-docker build -t homebox-shim:latest .
-docker run -d --name Homebox-Shim -p 3334:3334 \
+docker run -d --name HomeBoxMCP -p 3334:3334 \
   -v /path/to/config:/config:rw \
   -v /path/to/inbox:/inbox:ro \
-  homebox-shim:latest
+  ghcr.io/businessnone/homeboxmcp:latest
 ```
 
-Point your MCP client at `http://your-host:3334/mcp`. Check it's alive with
-`curl http://your-host:3334/healthz`, which reports the version and tool count.
-
-Prefer to sanity-check the config first?
+Or build from source:
 
 ```bash
-docker run --rm -v /path/to/config:/config:ro homebox-shim:latest \
-  node /app/index.mjs --doctor
+docker build -t homeboxmcp:latest .
 ```
+
+Point your MCP client at `http://your-host:3334/mcp` — that path is enforced, a POST
+anywhere else returns 404 naming the correct endpoint. Check the server is alive with
+`curl http://your-host:3334/healthz`, which reports the version and tool count.
+
+Prefer to sanity-check the config first? `--doctor` verifies the Homebox URL is reachable
+*and* that the credentials actually work, then exits non-zero with a one-line reason if not:
+
+```bash
+docker run --rm -v /path/to/config:/config:ro \
+  ghcr.io/businessnone/homeboxmcp:latest node /app/index.mjs --doctor
+```
+
+### Unraid
+
+An Unraid template lives at [`unraid/homeboxmcp.xml`](unraid/homeboxmcp.xml). Add it under
+**Docker → Add Container → Template** using the raw URL, or install from Community Apps
+once listed. Set the config and inbox paths to shares you control, and set an MCP auth
+token if the container is reachable beyond your LAN.
 
 ## Configuration
 
@@ -55,7 +71,7 @@ Write `/config/config.json`:
 ```
 
 Or skip the file entirely and use `HOMEBOX_URL` plus `HOMEBOX_API_KEY` — or
-`HOMEBOX_URL` with email and password, if you'd rather the Shim log in for itself.
+`HOMEBOX_URL` with email and password, if you'd rather HomeBoxMCP log in for itself.
 
 | Env | Default | Purpose |
 | --- | --- | --- |
@@ -66,8 +82,10 @@ Or skip the file entirely and use `HOMEBOX_URL` plus `HOMEBOX_API_KEY` — or
 | `MCP_AUTH_TOKEN` | unset | Bearer token required on every MCP request |
 | `MAX_REQUEST_BYTES` | `4000000` | Maximum accepted JSON-RPC request size |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug` |
+| `MCP_PATH` | `/mcp` | Path the JSON-RPC endpoint is served on |
+| `ENTITY_TYPE_TTL_MS` | `86400000` | How long Homebox entity type IDs are cached; `0` disables caching |
 
-If you expose the Shim beyond your own machine, set `MCP_AUTH_TOKEN`. Clients may send it
+If you expose HomeBoxMCP beyond your own machine, set `MCP_AUTH_TOKEN`. Clients may send it
 as `Authorization: Bearer <token>`, `X-MCP-Token`, or `X-Homebox-MCP-Token`.
 
 ## The 16 tools
@@ -84,7 +102,7 @@ as `Authorization: Bearer <token>`, `X-MCP-Token`, or `X-Homebox-MCP-Token`.
 ## Attachments, and why there's an inbox
 
 MCP tool calls carry JSON, not binary. Inlining a 10 MB receipt as base64 would burn
-~13 MB of the model's context to move one file. So files reach the Shim through a
+~13 MB of the model's context to move one file. So files reach HomeBoxMCP through a
 read-only inbox mount instead: drop the file in the inbox, then attach it by filename.
 
 Paths resolve against the inbox and are rejected if they try to escape it — `../../etc/passwd`
@@ -93,7 +111,7 @@ and absolute paths both fail closed. Valid attachment types are `attachment`, `p
 
 ## Origin story
 
-This repo exists because the Shim was discovered running with **no source on disk** — the
+This repo exists because HomeBoxMCP (then called `homebox-shim`) was discovered running with **no source on disk** — the
 only copy of `index.mjs` lived inside a running Docker image, with no Dockerfile anywhere.
 It was recovered with `docker cp Homebox-Shim:/app/index.mjs` and the Dockerfile
 reconstructed from the image's own config. This repo is now the source of truth. Rebuild
