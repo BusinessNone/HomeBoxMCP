@@ -1,0 +1,13 @@
+.git
+.gitignore
+.github
+test
+docs
+README.md
+LICENSE
+node_modules
+npm-debug.log
+*.log
+config.json
+Dockerfile
+.dockerignore

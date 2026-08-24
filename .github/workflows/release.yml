@@ -1,0 +1,97 @@
+name: Release
+
+# Publishing is kept out of ci.yml so the test workflow's triggers stay simple and
+# so no pull_request event can ever reach a job holding registry write permission.
+# PRs still build the image (see the "docker build (no push)" job in ci.yml).
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*.*.*"
+
+env:
+  IMAGE_NAME: homeboxmcp
+
+jobs:
+  version-check:
+    # The Unraid template and /healthz both surface a version to users, so a release
+    # tag that disagrees with package.json is a release that must not ship.
+    name: version consistency
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match package.json version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          echo "git tag version: $tag"
+          echo "package.json:    $pkg"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag v$tag does not match package.json version $pkg" >&2
+            exit 1
+          fi
+
+  publish:
+    name: build and publish to GHCR
+    runs-on: ubuntu-latest
+    needs: [version-check]
+    # version-check is skipped on branch pushes; always() keeps this job running
+    # there while still blocking on a genuine version mismatch for tag builds.
+    if: always() && needs.version-check.result != 'failure'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lowercase the image repository
+        # GHCR rejects uppercase path segments and the owner is mixed case.
+        id: image
+        run: |
+          set -euo pipefail
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "repo=ghcr.io/${owner}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.repo }}
+          # latest is opt-in so a default-branch build can never claim it.
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=edge,enable={{is_default_branch}}
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.title=homeboxMCP
+            org.opencontainers.image.description=Zero-dependency MCP server for Homebox inventory
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # linux/amd64 only, on purpose: Unraid is x86_64, so a multi-arch build
+          # would double CI time for a platform with no users.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
