@@ -3,6 +3,7 @@
 // labels renamed to "tags"). Built against /swagger/doc.json on v0.26.2.
 import http from "node:http";
 import fs from "node:fs";
+import path from "node:path";
 
 const CONFIG_PATH = process.env.CONFIG_PATH || "/config/config.json";
 const PORT = Number(process.env.PORT || 3334);
@@ -146,6 +147,63 @@ async function createEntity(isLocation, a) {
   if (Object.keys(rich).length === 0) return created;
   const current = await api("GET", `/entities/${created.id}`);
   return api("PUT", `/entities/${created.id}`, toUpdatePayload(current, rich));
+}
+
+
+// ── Attachments ──────────────────────────────────────────────────────────────
+// Homebox takes attachments as multipart/form-data on POST /entities/{id}/attachments.
+// MCP tool calls are JSON, so bytes reach us via a read-only inbox mount rather than
+// being inlined as base64 (a 10MB file would be ~13MB of base64 in the model's context).
+const INBOX = process.env.INBOX_PATH || "/inbox";
+
+// Homebox's own cap (HBOX_WEB_MAX_UPLOAD_SIZE, in MB). Reject early with a clear
+// message instead of letting the server return an opaque 413/422.
+const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 10);
+
+const ATTACHMENT_TYPES = ["attachment", "photo", "manual", "warranty", "receipt", "thumbnail"];
+
+const MIME = {
+  pdf: "application/pdf", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+  gif: "image/gif", webp: "image/webp", heic: "image/heic", svg: "image/svg+xml",
+  txt: "text/plain", md: "text/markdown", csv: "text/csv", json: "application/json",
+  doc: "application/msword", xls: "application/vnd.ms-excel", zip: "application/zip",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+};
+const mimeFor = (n) => MIME[(n.split(".").pop() || "").toLowerCase()] || "application/octet-stream";
+
+// Resolve a caller-supplied name against the inbox WITHOUT letting it escape.
+// path.resolve collapses ../ so we compare the final real path to the inbox root.
+function inboxPath(rel) {
+  if (!rel || typeof rel !== "string") throw new Error("file is required");
+  const full = path.resolve(INBOX, rel);
+  const root = path.resolve(INBOX);
+  if (full !== root && !full.startsWith(root + path.sep)) {
+    throw new Error(`refused: '${rel}' resolves outside the inbox`);
+  }
+  if (!fs.existsSync(full)) {
+    throw new Error(`not found: '${rel}'. Use list_inbox to see available files.`);
+  }
+  if (!fs.statSync(full).isFile()) throw new Error(`not a file: '${rel}'`);
+  return full;
+}
+
+// Same auth/retry contract as api(), but lets fetch set its own multipart boundary.
+// api() hardcodes Content-Type: application/json, so multipart needs this parallel path.
+async function apiUpload(urlPath, form, _retried = false) {
+  if (!token) await login();
+  const r = await fetch(`${BASE}${urlPath}`, {
+    method: "POST",
+    headers: { Authorization: token },
+    body: form,
+  });
+  if (r.status === 401 && !cfg.apiKey && !_retried) {
+    token = null;
+    return apiUpload(urlPath, form, true);
+  }
+  const text = await r.text();
+  if (!r.ok) throw new Error(`POST ${urlPath} -> ${r.status}: ${text.slice(0, 300)}`);
+  try { return JSON.parse(text); } catch { return text; }
 }
 
 const S = (desc) => ({ type: "string", description: desc });
@@ -320,6 +378,106 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {} },
     run: () => api("GET", "/groups/statistics"),
   },
+  {
+    name: "list_inbox",
+    description:
+      "List files staged in the upload inbox that are available to attach. Call this first if the user refers to a document by name rather than exact filename.",
+    inputSchema: { type: "object", properties: {} },
+    run: async () => {
+      if (!fs.existsSync(INBOX)) return { inbox: INBOX, mounted: false, files: [] };
+      const walk = (dir, rel = "") =>
+        fs.readdirSync(dir, { withFileTypes: true }).flatMap((d) => {
+          const r = rel ? `${rel}/${d.name}` : d.name;
+          if (d.isDirectory()) return walk(path.join(dir, d.name), r);
+          const st = fs.statSync(path.join(dir, d.name));
+          return [{
+            file: r,
+            sizeBytes: st.size,
+            sizeMB: +(st.size / 1048576).toFixed(2),
+            modified: st.mtime.toISOString(),
+            tooLarge: st.size > MAX_UPLOAD_MB * 1048576,
+          }];
+        });
+      return { inbox: INBOX, mounted: true, maxUploadMB: MAX_UPLOAD_MB, files: walk(INBOX) };
+    },
+  },
+  {
+    name: "upload_attachment",
+    description:
+      "Attach a document or photo from the inbox to an item or location. 'file' is a filename from list_inbox, not a host path. Use type=receipt for proofs of purchase, manual for user guides, warranty for warranty docs, photo for images of the item itself.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: S("Entity ID to attach to (from search_entities or entity_tree)"),
+        file: S("Filename inside the inbox, e.g. 'dishwasher-receipt.pdf'"),
+        name: S("Display name in Homebox, including extension. Defaults to the filename."),
+        type: {
+          type: "string",
+          enum: ATTACHMENT_TYPES,
+          description: "Attachment type (default: attachment)",
+        },
+        primary: B("Make this the item's primary image (photo type only)"),
+      },
+      required: ["id", "file"],
+    },
+    run: async (a) => {
+      const full = inboxPath(a.file);
+      const size = fs.statSync(full).size;
+      if (size > MAX_UPLOAD_MB * 1048576) {
+        throw new Error(
+          `'${a.file}' is ${(size / 1048576).toFixed(1)}MB; Homebox accepts at most ${MAX_UPLOAD_MB}MB.`
+        );
+      }
+      if (a.type && !ATTACHMENT_TYPES.includes(a.type)) {
+        throw new Error(`type must be one of: ${ATTACHMENT_TYPES.join(", ")}`);
+      }
+      const display = a.name || path.basename(full);
+      const form = new FormData();
+      form.append("file", new Blob([fs.readFileSync(full)], { type: mimeFor(display) }), display);
+      form.append("name", display);
+      form.append("type", a.type || "attachment");
+      if (a.primary !== undefined) form.append("primary", String(!!a.primary));
+      const res = await apiUpload(`/entities/${a.id}/attachments`, form);
+      return { uploaded: display, sizeBytes: size, type: a.type || "attachment", entity: res };
+    },
+  },
+  {
+    name: "delete_attachment",
+    description: "Remove an attachment from an item or location. Attachment IDs come from get_entity.",
+    inputSchema: {
+      type: "object",
+      properties: { id: S("Entity ID"), attachmentId: S("Attachment ID") },
+      required: ["id", "attachmentId"],
+    },
+    run: (a) => api("DELETE", `/entities/${a.id}/attachments/${a.attachmentId}`),
+  },
+  {
+    name: "link_external_attachment",
+    description:
+      "Attach a reference to a document stored elsewhere (no file is uploaded or copied into Homebox). Use when the document lives in another system and you only want a pointer to it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: S("Entity ID"),
+        title: S("Display title for the link"),
+        externalId: S("Identifier in the source system"),
+        sourceType: S("Name of the source system, e.g. 'paperless'"),
+        attachmentType: {
+          type: "string",
+          enum: ATTACHMENT_TYPES,
+          description: "Attachment type (default: attachment)",
+        },
+      },
+      required: ["id", "title"],
+    },
+    run: (a) =>
+      api("POST", `/entities/${a.id}/attachments/external`, {
+        title: a.title,
+        external_id: a.externalId ?? "",
+        source_type: a.sourceType ?? "",
+        attachment_type: a.attachmentType || "attachment",
+      }),
+  },
 ];
 
 const BY_NAME = new Map(TOOLS.map((t) => [t.name, t]));
@@ -337,7 +495,7 @@ async function handleRpc(msg) {
     return reply({
       protocolVersion: params?.protocolVersion || "2024-11-05",
       capabilities: { tools: {} },
-      serverInfo: { name: "homebox-shim", version: "1.0.0" },
+      serverInfo: { name: "homebox-shim", version: "1.1.0" },
       instructions:
         "Homebox inventory. Call entity_tree first to discover location IDs, then create_item with parentId set.",
     });
