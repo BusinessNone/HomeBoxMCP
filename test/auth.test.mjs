@@ -48,6 +48,27 @@ describe("MCP_AUTH_TOKEN gating", () => {
     assert.deepEqual(res.body.result, {});
   });
 
+  it("prefers X-MCP-Token over an Authorization header it does not own", async () => {
+    // Cloudflare Access with managed OAuth forwards its own bearer to the
+    // origin. Reading authorization first meant the proxy's token was checked
+    // against MCP_AUTH_TOKEN and every proxied request 401'd, with no header
+    // the edge could add to fix it.
+    const res = await shim.rpc(PING, {
+      headers: { Authorization: "Bearer cf-access-opaque-token", "X-MCP-Token": TOKEN },
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body.result, {});
+  });
+
+  it("still rejects a wrong X-MCP-Token even beside a correct bearer", async () => {
+    // The flip side of the precedence: the specific header is the answer, not
+    // a fallback to try after it fails.
+    const res = await shim.rpc(PING, {
+      headers: { Authorization: `Bearer ${TOKEN}`, "X-MCP-Token": "wrong-token" },
+    });
+    assert.equal(res.status, 401);
+  });
+
   it("leaves GET /healthz unauthenticated so orchestrators can probe it", async () => {
     const res = await shim.get("/healthz");
     assert.equal(res.status, 200);

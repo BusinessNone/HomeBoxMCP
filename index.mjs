@@ -720,7 +720,14 @@ const MCP_TOKEN = process.env.MCP_AUTH_TOKEN ? process.env.MCP_AUTH_TOKEN.trim()
 
 function hasValidMcpAuth(req) {
   if (!MCP_TOKEN) return true;
-  const supplied = req.headers.authorization ?? req.headers["x-mcp-token"] ?? req.headers["x-homebox-mcp-token"];
+  // The dedicated headers win over `authorization`, because behind an
+  // authenticating proxy that header belongs to the proxy. Cloudflare Access
+  // with managed OAuth forwards its own `Authorization: Bearer <opaque>` to the
+  // origin, and reading that first meant every proxied request was checked
+  // against Access's token and rejected — a 401 no header we added could fix,
+  // since `authorization` shadowed it. Checked in specificity order: a caller
+  // who sets x-mcp-token means it, and only a direct caller sets authorization.
+  const supplied = req.headers["x-mcp-token"] ?? req.headers["x-homebox-mcp-token"] ?? req.headers.authorization;
   if (!supplied) return false;
   const value = Array.isArray(supplied) ? supplied[0] : supplied;
   const token = value.startsWith("Bearer ") ? value.slice(7).trim() : value.trim();
